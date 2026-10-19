@@ -173,6 +173,10 @@ pub enum EscrowErrorExt {
     SideBetsNotSettled = 54,
     /// Side bet token differs from the match wager token (Issue #459).
     SideBetTokenMismatch = 55,
+    /// Self-play matches between identical player addresses are rejected.
+    SelfMatchNotAllowed = 56,
+    /// Provided address parameter is invalid or null.
+    InvalidAddress = 57,
 }
 
 /// Payload for player deposit authorization with nonce-based replay protection (Issue #284).
@@ -3277,6 +3281,9 @@ impl ChessterEscrow {
         if env.storage().persistent().has(&game_code) {
             panic_with_error!(&env, EscrowError::MatchAlreadyExists);
         }
+        if !Self::is_token_whitelisted(env.clone(), token.clone()) {
+            panic_with_error!(&env, EscrowError::TokenNotWhitelisted);
+        }
         Self::validate_wager_amount(&env, &token, amount);
 
         let player1_key = (Symbol::new(&env, "act_m"), player1.clone());
@@ -3403,7 +3410,7 @@ impl ChessterEscrow {
             panic_with_error!(&env, EscrowError::AlreadyJoined);
         }
         if m.player1 == player2 {
-            panic_with_error!(&env, EscrowError::CannotJoinOwnMatch);
+            panic_with_error!(&env, EscrowErrorExt::SelfMatchNotAllowed);
         }
 
         let player2_key = (Symbol::new(&env, "act_m"), player2.clone());
