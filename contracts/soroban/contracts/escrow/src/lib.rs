@@ -251,6 +251,24 @@ pub enum SideBetOutcome {
     Refund = 3,
 }
 
+/// Protocol fee discount tier assigned to a verified community organizer
+/// (Issue #578). The tier is configured by the coordinator (admin) via
+/// `set_organizer_tier` and applied to the protocol fee charged when matches
+/// created by the organizer are settled.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum OrganizerTier {
+    /// No verified organizer status: pays the full standard protocol fee.
+    Standard = 0,
+    /// Bronze organizer: 10% discount off the standard protocol fee.
+    Bronze = 1,
+    /// Silver organizer: 25% discount off the standard protocol fee.
+    Silver = 2,
+    /// Gold organizer: 50% discount off the standard protocol fee.
+    Gold = 3,
+}
+
 /// Aggregate spectator side pool for a match (Issue #459). Individual stakes live under
 /// `DataKey::SideBetStake` so that placing, settling and claiming never iterate over bettors.
 #[contracttype]
@@ -1049,6 +1067,8 @@ pub enum DataKey {
     SideBetStake(String, Address, PlayerColor),
     /// Protocol fee (bps) taken from losing spectator side pools (Issue #459).
     SideBetFeeBps,
+    /// Protocol fee discount tier of an organizer (Issue #578).
+    OrganizerTier(Address),
 }
 
 /// Aggregated operational metrics for off-chain indexing and monitoring (Issue #288).
@@ -1437,6 +1457,71 @@ impl ChessterEscrow {
         let fee = (total_pool * (effective_bps as i128)) / 10_000;
         let net = total_pool - fee;
         (net, fee)
+    }
+
+    /// Sets (or updates) the protocol fee discount tier of an organizer
+    /// (Coordinator/admin only) (Issue #578).
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    /// * `organizer` - Organizer address whose tier is configured.
+    /// * `tier` - Protocol fee discount tier to assign.
+    pub fn set_organizer_tier(env: Env, organizer: Address, tier: OrganizerTier) {
+        let coordinator = Self::get_coordinator(env.clone());
+        coordinator.require_auth();
+        let key = DataKey::OrganizerTier(organizer.clone());
+        env.storage().persistent().set(&key, &tier);
+        Self::bump_entry_ttl(&env, &key);
+        env.events()
+            .publish((symbol_short!("tier_set"), organizer), tier);
+    }
+
+    /// Retrieves the protocol fee discount tier of an organizer (Issue #578).
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    /// * `organizer` - Organizer address to query.
+    ///
+    /// # Returns
+    /// * `OrganizerTier` - Assigned tier, `Standard` when never set.
+    pub fn get_organizer_tier(env: Env, organizer: Address) -> OrganizerTier {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OrganizerTier(organizer))
+            .unwrap_or(OrganizerTier::Standard)
+    }
+
+    /// Returns the protocol fee discount basis points granted to an organizer
+    /// by tier (Issue #578): Bronze 10%, Silver 25%, Gold 50% off the standard
+    /// protocol fee schedule.
+    ///
+    /// # Arguments
+    /// * `env` - Environment reference.
+    /// * `organizer` - Organizer address to query.
+    ///
+    /// # Returns
+    /// * `u32` - Discount in basis points off the standard protocol fee.
+    pub fn get_organizer_discount_bps(env: Env, organizer: Address) -> u32 {
+        match Self::get_organizer_tier(env, organizer) {
+            OrganizerTier::Standard => 0,
+            OrganizerTier::Bronze => 1_000,
+            OrganizerTier::Silver => 2_500,
+            OrganizerTier::Gold => 5_000,
+        }
+    }
+
+    /// Applies an organizer tier discount to a protocol fee:
+    /// `adjusted = fee - (fee * discount_bps / 10_000)` (Issue #578).
+    /// Uses the overflow-safe `mul_div_bps` decomposition so the discount
+    /// computes without overflow even at maximum pool sizes, and truncates
+    /// towards zero so the charged fee never exceeds the undiscounted fee.
+    fn organizer_discounted_fee(env: &Env, standard_fee: i128, organizer: &Address) -> i128 {
+        let discount_bps = Self::get_organizer_discount_bps(env.clone(), organizer.clone());
+        if discount_bps == 0 {
+            return standard_fee;
+        }
+        let (discount, _) = mul_div_bps(env, standard_fee, discount_bps);
+        checked_sub(env, standard_fee, discount)
     }
 
     /// Retrieves current match creation nonce counter (Issue #34).
@@ -4254,7 +4339,10 @@ impl ChessterEscrow {
         // a window where the match still looks unresolved. ---
         let admin_fee: i128 = if let Some(ref w) = winner {
             let admin_bps = Self::get_effective_fee_bps(env.clone(), w.clone());
-            Self::normalized_fee(env, &m.token, m.total_staked, admin_bps)
+            let standard_fee = Self::normalized_fee(env, &m.token, m.total_staked, admin_bps);
+            // Issue #578: apply the tier discount of the match creator
+            // (`player1`), the match organizer, to the standard protocol fee.
+            Self::organizer_discounted_fee(env, standard_fee, &m.player1)
         } else {
             0
         };
@@ -5717,7 +5805,19 @@ impl ChessterEscrow {
                     fee_bps = (base_fee_bps * 3) / 4;
                 }
             }
+
+            // Issue #578: apply the organizer protocol fee discount to the
+            // tournament rake. The tournament type does not persist an
+            // organizer address, so the tier of the top-ranked winner is used,
+            // mirroring the governance discount above.
+            let discount_bps = Self::get_organizer_discount_bps(env.clone(), top_winner.clone());
+            if discount_bps > 0 {
+                let discounted = ((fee_bps as i128) * (BPS_DENOMINATOR - discount_bps as i128))
+                    / BPS_DENOMINATOR;
+                fee_bps = discounted as u32;
+            }
         }
+
         let (net_pool, rake) =
             Self::calculate_tournament_rake(&env, tournament.total_pool, fee_bps);
 

@@ -4701,6 +4701,304 @@ fn test_mutual_cancellation_outsider_cannot_confirm() {
     client.confirm_mutual_cancellation(&game_code, &outsider);
 }
 
+// ---------------------------------------------------------------------------
+// Tests for Issue #578: Organizer Tier Registry and tiered protocol fee discounts
+// ---------------------------------------------------------------------------
+
+struct OrganizerTierSetup<'a> {
+    client: ChessterEscrowClient<'a>,
+    contract_id: Address,
+    token: TokenClient<'a>,
+    token_admin_client: TokenAdminClient<'a>,
+    treasury: Address,
+}
+
+fn setup_organizer_tier_test(env: &Env) -> OrganizerTierSetup<'_> {
+    env.mock_all_auths();
+    let coordinator = Address::generate(env);
+    let treasury = Address::generate(env);
+    let token_admin = Address::generate(env);
+
+    let (token, token_admin_client) = create_token_contract(env, &token_admin);
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(env, &contract_id);
+
+    client.init(&coordinator, &500); // 5% standard protocol fee
+    client.set_treasury_vault(&treasury);
+    client.add_whitelisted_token(&token.address);
+
+    OrganizerTierSetup {
+        client,
+        contract_id,
+        token,
+        token_admin_client,
+        treasury,
+    }
+}
+
+/// Creates and funds an Active match wagering `wager` per player with
+/// `player1` as the match creator/organizer.
+fn create_organizer_match(
+    env: &Env,
+    setup: &OrganizerTierSetup,
+    code: &str,
+    player1: &Address,
+    player2: &Address,
+    wager: i128,
+) -> String {
+    setup.token_admin_client.mint(player1, &(wager * 2));
+    setup.token_admin_client.mint(player2, &(wager * 2));
+    approve(env, &setup.token, player1, &setup.contract_id, wager * 2);
+    approve(env, &setup.token, player2, &setup.contract_id, wager * 2);
+    let game_code = String::from_str(env, code);
+    setup
+        .client
+        .create_match(&game_code, player1, &setup.token.address, &wager);
+    setup.client.join_match(&game_code, player2);
+    game_code
+}
+
+/// Unranked organizers keep the full baseline protocol fee schedule (Issue #578).
+#[test]
+fn test_organizer_standard_tier_keeps_baseline_fee() {
+    let env = Env::default();
+    let s = setup_organizer_tier_test(&env);
+    let player1 = Address::generate(&env);
+    let player2 = Address::generate(&env);
+
+    assert_eq!(
+        s.client.get_organizer_tier(&player1),
+        OrganizerTier::Standard
+    );
+    assert_eq!(s.client.get_organizer_discount_bps(&player1), 0);
+
+    let wager = 100i128;
+    let game_code = create_organizer_match(&env, &s, "ORG_STD_1", &player1, &player2, wager);
+    assert_eq!(s.token.balance(&s.contract_id), wager * 2);
+
+    s.client.resolve_match(&game_code, &Some(player2.clone()));
+
+    // Standard tier: full standard fee = 500 bps of the 200 pool = 10.
+    assert_eq!(s.token.balance(&s.contract_id), 0);
+    assert_eq!(s.token.balance(&s.treasury), 10);
+    assert_eq!(s.client.get_total_fees_collected(&s.token.address), 10);
+    assert_eq!(s.token.balance(&player1), 100);
+    assert_eq!(s.token.balance(&player2), 290);
+}
+
+/// Admin can set and overwrite an organizer's tier; tiers are per-address.
+#[test]
+fn test_set_organizer_tier_overwrite_and_query() {
+    let env = Env::default();
+    let s = setup_organizer_tier_test(&env);
+    let player1 = Address::generate(&env);
+    let player2 = Address::generate(&env);
+
+    s.client.set_organizer_tier(&player1, &OrganizerTier::Gold);
+    assert_eq!(s.client.get_organizer_tier(&player1), OrganizerTier::Gold);
+    assert_eq!(s.client.get_organizer_discount_bps(&player1), 5_000);
+
+    // Overwriting replaces the previous tier.
+    s.client
+        .set_organizer_tier(&player1, &OrganizerTier::Bronze);
+    assert_eq!(s.client.get_organizer_tier(&player1), OrganizerTier::Bronze);
+    assert_eq!(s.client.get_organizer_discount_bps(&player1), 1_000);
+
+    // Tier is per-address: another organizer remains Standard.
+    assert_eq!(
+        s.client.get_organizer_tier(&player2),
+        OrganizerTier::Standard
+    );
+}
+
+/// Bronze, Silver and Gold organizers each deduct exactly the configured
+/// discount percentage from the standard protocol fee at settlement, while
+/// player payouts and platform accounting stay exact (Issue #578).
+#[test]
+fn test_organizer_tiers_apply_exact_discounted_fees() {
+    let cases = [
+        (
+            OrganizerTier::Bronze,
+            1_000u32,
+            9i128,
+            191i128,
+            "ORG_BRONZE",
+        ),
+        (OrganizerTier::Silver, 2_500u32, 8, 192, "ORG_SILVER"),
+        (OrganizerTier::Gold, 5_000u32, 5, 195, "ORG_GOLD"),
+    ];
+    for (idx, &(tier, discount_bps, expected_fee, expected_payout, code)) in
+        cases.iter().enumerate()
+    {
+        let env = Env::default();
+        let s = setup_organizer_tier_test(&env);
+        let player1 = Address::generate(&env);
+        let player2 = Address::generate(&env);
+
+        s.client.set_organizer_tier(&player1, &tier);
+        assert_eq!(s.client.get_organizer_tier(&player1), tier);
+        assert_eq!(s.client.get_organizer_discount_bps(&player1), discount_bps);
+
+        let game_code = create_organizer_match(&env, &s, code, &player1, &player2, 100);
+
+        // Standard fee = 500 bps of the 200 pool = 10; discount removes
+        // exactly discount_bps% of it, independent of which player wins.
+        let winner = if idx % 2 == 0 {
+            player1.clone()
+        } else {
+            player2.clone()
+        };
+        s.client.resolve_match(&game_code, &Some(winner.clone()));
+
+        assert_eq!(s.token.balance(&s.contract_id), 0);
+        assert_eq!(s.token.balance(&s.treasury), expected_fee);
+        assert_eq!(
+            s.client.get_total_fees_collected(&s.token.address),
+            expected_fee
+        );
+        let p1_expected = 100
+            + if winner == player1 {
+                expected_payout
+            } else {
+                0
+            };
+        let p2_expected = 100
+            + if winner == player2 {
+                expected_payout
+            } else {
+                0
+            };
+        assert_eq!(s.token.balance(&player1), p1_expected);
+        assert_eq!(s.token.balance(&player2), p2_expected);
+    }
+}
+
+/// A zero protocol fee schedule stays zero for every organizer tier; no fee
+/// is charged and no panic occurs (Issue #578).
+#[test]
+fn test_organizer_tier_zero_fee_match() {
+    let env = Env::default();
+    let s = setup_organizer_tier_test(&env);
+    let player1 = Address::generate(&env);
+    let player2 = Address::generate(&env);
+
+    s.client.set_organizer_tier(&player1, &OrganizerTier::Gold);
+    s.client.set_fee_bps(&0);
+
+    let game_code = create_organizer_match(&env, &s, "ORG_ZERO_FEE", &player1, &player2, 100);
+    s.client.resolve_match(&game_code, &Some(player1.clone()));
+
+    assert_eq!(s.token.balance(&s.contract_id), 0);
+    assert_eq!(s.token.balance(&s.treasury), 0);
+    assert_eq!(s.client.get_total_fees_collected(&s.token.address), 0);
+    assert_eq!(s.token.balance(&player1), 300);
+    assert_eq!(s.token.balance(&player2), 100);
+}
+
+/// Near-maximum-wager settlement with a Gold organizer discount does not
+/// overflow or underflow and conserves every token (Issue #578).
+#[test]
+fn test_organizer_tier_no_overflow_on_maximum_wager() {
+    let env = Env::default();
+    let s = setup_organizer_tier_test(&env);
+    let player1 = Address::generate(&env);
+    let player2 = Address::generate(&env);
+
+    s.client.set_organizer_tier(&player1, &OrganizerTier::Gold);
+
+    let wager: i128 = 100_000_000_000_000_000_000_000_000_000_000_000; // 1e35
+    let total = wager * 2; // 2e35, still well within i128 range
+    let game_code = create_organizer_match(&env, &s, "ORG_MAX_WAGER", &player1, &player2, wager);
+    s.client.resolve_match(&game_code, &Some(player1.clone()));
+
+    // Standard fee = total/20 = 1e34; Gold discount removes half = total/40.
+    let expected_fee = total / 40;
+    let expected_payout = total - expected_fee;
+    assert_eq!(s.token.balance(&s.contract_id), 0);
+    assert_eq!(s.token.balance(&s.treasury), expected_fee);
+    assert_eq!(s.token.balance(&player1), wager + expected_payout);
+    assert_eq!(s.token.balance(&player2), wager);
+}
+
+/// Tournament rake applies the organizer tier discount of the top-ranked
+/// winner to the configured tournament fee (Issue #578).
+#[test]
+fn test_organizer_tier_discounts_tournament_rake() {
+    let env = Env::default();
+    let s = setup_organizer_tier_test(&env);
+    let player1 = Address::generate(&env);
+    let player2 = Address::generate(&env);
+
+    s.client
+        .set_organizer_tier(&player1, &OrganizerTier::Silver); // 25% off
+    s.client.set_tournament_fee_bps(&500);
+
+    s.token_admin_client.mint(&player1, &10_000);
+    s.token_admin_client.mint(&player2, &10_000);
+    approve(&env, &s.token, &player1, &s.contract_id, 20_000);
+    approve(&env, &s.token, &player2, &s.contract_id, 20_000);
+
+    let tournament_id = String::from_str(&env, "ORG_TOURNEY");
+    s.client
+        .create_tournament(&tournament_id, &100, &2, &2, &0, &s.token.address);
+    s.client.join_tournament(&tournament_id, &player1);
+    s.client.join_tournament(&tournament_id, &player2);
+
+    let mut winners = vec![&env];
+    winners.push_back(player1.clone());
+    let mut payout_bps = vec![&env];
+    payout_bps.push_back(10_000u32);
+    s.client
+        .complete_tournament(&tournament_id, &winners, &payout_bps);
+
+    // Standard rake = 500 bps of the 200 pool = 10 bps-equivalent; Silver
+    // discounts the fee tier to 375 bps, so rake = 200 * 375 / 10_000 = 7.
+    assert_eq!(s.token.balance(&s.treasury), 7);
+    assert_eq!(s.token.balance(&player1), 10_000 - 100 + 193);
+    assert_eq!(s.token.balance(&player2), 10_000 - 100);
+    assert_eq!(s.token.balance(&s.contract_id), 0);
+}
+
+/// Only the coordinator (admin) may call `set_organizer_tier` (Issue #578).
+#[test]
+fn test_set_organizer_tier_requires_coordinator_auth() {
+    let env = Env::default();
+    let coordinator = Address::generate(&env);
+    let non_coordinator = Address::generate(&env);
+
+    let contract_id = env.register(ChessterEscrow, ());
+    let client = ChessterEscrowClient::new(&env, &contract_id);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &coordinator,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: (&coordinator, 500u32).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.init(&coordinator, &500);
+
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_coordinator,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_organizer_tier",
+            args: (&non_coordinator, OrganizerTier::Gold).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = client.try_set_organizer_tier(&non_coordinator, &OrganizerTier::Gold);
+
+    assert!(result.is_err());
+    assert_eq!(
+        client.get_organizer_tier(&non_coordinator),
+        OrganizerTier::Standard
+    );
+}
+
 mod extended_tests {
     #![cfg(test)]
 
